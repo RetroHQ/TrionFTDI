@@ -11,9 +11,9 @@
 // Config Flash		JTAG
 // Channel A		Channel B
 // AD0, CCK			BD0, TCK
-// AD1, CDI0		DB1, TDI
-// AD2, CDI1		DB2, TDO
-// AD3, SS#			DB3, TMS
+// AD1, CDI0		BD1, TDI
+// AD2, CDI1		BD2, TDO
+// AD3, SS#			BD3, TMS
 // AD4, CRESET_N
 // AD5, CDONE
 ////////////////////////////////////////////////////////////////////////////////
@@ -277,6 +277,55 @@ bool ConfigWriteCommand(u8 cmd)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Write command with data and return data of given size
+////////////////////////////////////////////////////////////////////////////////
+
+bool ConfigWriteCommandWithData(u8 cmd, const void *bufOut, void *bufIn, u32 size)
+{
+	const u32 buflen = 11 + ((size > 0) ? (size + 3) : 0);
+	u8* buf = new u8[buflen];
+	u8* ptr = buf;
+	  
+	*ptr++ = SET_BITS_LOW;
+	*ptr++ = gGPIO & ~CA_SS_N;
+	*ptr++ = CA_SS_N | CA_CRESET_N | CA_CDI0 | CA_CCK;
+
+	*ptr++ = (u8)(MPSSE_DO_WRITE | MPSSE_WRITE_NEG);
+	*ptr++ = 0;
+	*ptr++ = 0;
+
+	*ptr++ = cmd;
+	
+	if (size)
+	{
+		*ptr++ = (u8)(MPSSE_DO_WRITE | MPSSE_WRITE_NEG | (bufIn != 0 ? MPSSE_DO_READ : 0));
+		*ptr++ = (u8)(size - 1);
+		*ptr++ = (u8)((size - 1) >> 8);
+
+		if (bufOut > (void*)0xff) memcpy(ptr, bufOut, size);
+		else memset(ptr, (u8)bufOut, size);
+		ptr += size;
+	}
+
+	*ptr++ = SET_BITS_LOW;
+	*ptr++ = gGPIO | CA_SS_N;
+	*ptr++ = CA_SS_N | CA_CRESET_N | CA_CDI0 | CA_CCK;
+	*ptr++ = SEND_IMMEDIATE;
+
+	// write the command stream
+	bool bOk = ftdi_write_data(gFTDIA, buf, buflen) == buflen;
+
+	// if we need to read data back as well, do it now
+	if (bOk && bufIn)
+	{
+		bOk = ftdi_read_data(gFTDIA, (unsigned char*)bufIn, size) == size;
+	}
+
+	delete buf;
+	return bOk;
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Write command with address and return data of given size
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -363,7 +412,14 @@ bool ConfigReadDeviceId(u16 *id)
 
 bool ConfigReadUniqueId(void *uid)
 {
-	return ConfigWriteCommandWithAddrAndData(CMD_READ_UNIQUE_ID, 0, 0, uid, 16);
+	// read into temp buffer with dummy byte
+	char temp[17];
+	bool r = ConfigWriteCommandWithAddrAndData(CMD_READ_UNIQUE_ID, 0, 0, temp, 17);
+
+	// skip dummy and just return uid
+	memcpy(uid, temp + 1, 16);
+	
+	return r;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -400,6 +456,27 @@ bool ConfigPollStatusComplete()
 	}
 
 	return bOk;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Get status registers
+////////////////////////////////////////////////////////////////////////////////
+
+bool ConfigGetStatus(u16 *status)
+{
+	return	ConfigWriteCommandWithData(CMD_READ_STATUS_REGISTER1, 0, status, 1) &&
+			ConfigWriteCommandWithData(CMD_READ_STATUS_REGISTER2, 0, ((u8*)status) + 1, 1);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Set status registers
+////////////////////////////////////////////////////////////////////////////////
+
+bool ConfigSetStatus(const u16 status)
+{
+	return	ConfigWriteEnable() &&
+			ConfigWriteCommandWithData(CMD_WRITE_STATUS_REGISTERS, &status, 0, 2) &&
+			ConfigPollStatusComplete();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -534,6 +611,9 @@ void ShowDeviceInfo()
 	}
 	fprintf(stdout, "\n");
 
+	u16 status;
+	ConfigGetStatus(&status);
+	fprintf(stdout, "Status: %04x (QE: %s)\n", status, status & STATUS_QUAD_ENABLE ? "Yes" : "No");
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -652,7 +732,7 @@ void ConfigProgramHex(const char* pFilename, const u32 writeAddr, const u8 mode 
 			{
 				if (n == 0)
 				{
-					printf("Erasing... ");
+					printf("Erasing ($%x-$%x)... ", writeAddr, writeAddr + ((hexSize + 4095) & ~4095) - 1);
 					if (ConfigEraseArea(writeAddr, hexSize)) printf("OK!\n");
 					else
 					{
@@ -662,7 +742,7 @@ void ConfigProgramHex(const char* pFilename, const u32 writeAddr, const u8 mode 
 				}
 				else
 				{
-					if (n == 1) printf("Programming... ");
+					if (n == 1) printf("Programming ($%x-$%x)... ", writeAddr, writeAddr + hexSize - 1);
 					else printf("Verifying... ");
 
 					s32 percent = -1;
@@ -759,7 +839,8 @@ int main(int argc, const char **argv)
 			"-f {freq}                 Set SPI frequency (Mhz), default 20Mhz\n"
 			"-i                        Display chip information\n"
 			"-c                        Trigger FPGA config\n"
-			"-e                        Erase whole chip\n"
+			"-q [on|off]               Enable or disable quad spi flag\n"
+			"-e [addr size]            Erase area (whole chip by default, use $ or 0x for hex)\n"
 			"-w[ev] file.hex [addr]    Write hex file with optial [e]rase and [v]erify to address (default 0, use $ or 0x for hex)\n"
 			"-v file.hex [addr]        Verify contents of config prom at address match this file\n"
 			, argv[0]);
@@ -798,6 +879,27 @@ int main(int argc, const char **argv)
 				ShowDeviceInfo();
 			}
 
+			// quad mode
+			else if (_stricmp(argv[n], "-q") == 0)
+			{
+				bool bQuad = true;
+				if (((n + 1) < argc) && argv[n+1][0] != '-')
+				{
+					n++;
+					bQuad = _stricmp(argv[n], "on") == 0;
+				}
+				
+				// change quad mode if needed
+				u16 status;
+				ConfigGetStatus(&status);
+				if (!!(status & STATUS_QUAD_ENABLE) != bQuad)
+				{
+					status &= ~STATUS_QUAD_ENABLE;
+					if (bQuad) status |= STATUS_QUAD_ENABLE;
+					ConfigSetStatus(status);
+				}
+			}
+
 			// FPGA config
 			else if (_stricmp(argv[n], "-c") == 0)
 			{
@@ -810,9 +912,31 @@ int main(int argc, const char **argv)
 			// erase chip
 			else if (_stricmp(argv[n], "-e") == 0)
 			{
-				printf("Erasing... ");
-				if (ConfigEraseAll()) printf("OK!\n");
-				else printf("FAILED!\n");
+				u32 nStartAddress = 0;
+				u32 nSize = 0;
+				if (((n + 1) < argc) && argv[n+1][0] != '-')
+				{
+					n++;
+					nStartAddress = StringToNumber(argv[n]);
+					if (((n + 1) < argc) && argv[n+1][0] != '-')
+					{
+						n++;
+						nSize = StringToNumber(argv[n]);
+					}
+				}
+
+				if (nStartAddress == 0 && nSize == 0)
+				{
+					printf("Erasing (all)... ");
+					if (ConfigEraseAll()) printf("OK!\n");
+					else printf("FAILED!\n");
+				}
+				else
+				{
+					printf("Erasing ($%x-$%x)... ", nStartAddress, nStartAddress + ((nSize + 4095) & ~4095) - 1);
+					if (ConfigEraseArea(nStartAddress, nSize)) printf("OK!\n");
+					else printf("FAILED!\n");
+				}
 			}
 
 			// write hex
